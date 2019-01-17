@@ -15,13 +15,25 @@ import (
 	"runtime"
 )
 
+type FileHash struct {
+	Size     int64
+	Checksum string
+}
+
+type TFileHash map[string]*FileHash
+
+func (this *FileHash) IsSame(cmp *FileHash) bool {
+	return this.Size == cmp.Size && this.Checksum == cmp.Checksum
+}
+
 var (
 	srcDir       string
 	targetDir    string
 	logLevelFlag string
 	isDryRun     bool
 	isDebug      bool
-	srcFiles     map[string]string
+	srcFiles     TFileHash
+	targetFiles  TFileHash
 )
 
 func init() {
@@ -65,30 +77,39 @@ func initialize() {
 	}
 	// TODO: check that src/target are not inside each other.
 
-	srcFiles = make(map[string]string)
+	srcFiles = make(TFileHash)
+	targetFiles = make(TFileHash)
 	log.Debugf("Source dir: %q", srcDir)
 	log.Debugf("Target dir: %q", targetDir)
 	return
 }
 
-func getAllSourceFiles() {
-	err := os.Chdir(srcDir)
+func walkFiles(hashes TFileHash, rootDir string, doChecksum bool) {
+	err := os.Chdir(rootDir)
 	if err != nil {
-		log.Fatal("Could not change to source directory %q: %v", srcDir, err)
+		log.Fatal("Could not change to directory %q: %v", rootDir, err)
 	}
-	log.Debugf("Checksumming all files in %q", srcDir)
+	log.Debugf("Walking all files in %q", rootDir)
 	err = filepath.Walk(".", func(path string, info os.FileInfo, err error) error {
 		if err != nil {
-			return fmt.Errorf("Could not access the source path %q: %v", path, err)
+			return fmt.Errorf("Could not access the path %q: %v", path, err)
 		}
 		if info.Mode().IsRegular() {
-			log.Debugf("Found source file %q", path)
-			srcFiles[path] = checksumFile(path)
+			log.Debugf("Found file %q", path)
+			var checksum string
+			if doChecksum {
+				checksum = checksumFile(path)
+			}
+			filehash := FileHash{
+				Size:     info.Size(),
+				Checksum: checksum,
+			}
+			hashes[path] = &filehash
 		}
 		return nil
 	})
 	if err != nil {
-		log.Fatal("Error walking the source tree %q: %v\n", srcDir, err)
+		log.Fatal("Error walking the tree %q: %v\n", rootDir, err)
 	}
 }
 
@@ -98,68 +119,59 @@ func compareAndRenameTargetFiles() {
 		log.Fatal("Could not change to target directory %q: %v", targetDir, err)
 	}
 	log.Debugf("Comparing files in the target %q", targetDir)
-	err = filepath.Walk(".", func(path string, info os.FileInfo, err error) error {
-		if err != nil {
-			return fmt.Errorf("Could not access the target path %q: %v", path, err)
+	for target_path, filehash := range targetFiles {
+		var _, ok = srcFiles[target_path]
+		if !ok {
+			handleTargetFile(target_path, filehash)
+		} else {
+			log.Debugf("Skipping: target exists in src: %q", target_path)
 		}
-		if info.Mode().IsRegular() {
-			log.Debugf("Found target file %q", path)
-			handleTargetFile(path)
-		}
-		return nil
-	})
-	if err != nil {
-		log.Fatal("Error walking the target tree %q: %v\n", srcDir, err)
 	}
 }
 
-func handleTargetFile(target_filepath string) {
-	var _, ok = srcFiles[target_filepath]
-	if ok {
-		log.Debugf("Skipping: target exists in src: %q", target_filepath)
-		// target exists in src, so do nothing.
-		return
-	}
-
-	// The target does not exist in src, so it *may* have been a src file that was
-	// renamed. Checksum the target and see if it matches the sum of any other file.
-	var target_checksum = checksumFile(target_filepath)
-	var found = false
-	var src_filepath string
-	var checksum string
-	for src_filepath, checksum = range srcFiles {
-		if checksum == target_checksum {
+func findSrcFileByFileHash(filehash *FileHash) (src_path string, found bool) {
+	var src_filehash *FileHash
+	for src_path, src_filehash = range srcFiles {
+		if src_filehash.IsSame(filehash) {
 			found = true
-			break
+			return
 		}
 	}
+	return
+}
+
+func handleTargetFile(target_path string, target_filehash *FileHash) {
+	// The target does not exist in src, so it's either been deleted in src,
+	// or it was moved/renamed in src. To see if it was the latter, checksum the
+	// target search for it in the srcFiles.
+	target_filehash.Checksum = checksumFile(target_path)
+	var new_target_path, found = findSrcFileByFileHash(target_filehash)
 	if !found {
-		// There was no src file that matched the target file's checksum. This means
+		// There was no src file that matched the target file's size & checksum. This means
 		// the target should be deleted... but we'll let rsync handle that.
-		log.Debugf("Skipping: no src file has the same checksum as this target: %q", target_filepath)
+		log.Debugf("Skipping: no src file has the same size/checksum as this target: %q", target_path)
 		return
 	}
 
-	var new_target_filepath = src_filepath
-	_, err := os.Stat(new_target_filepath)
+	_, err := os.Stat(new_target_path)
 	if !os.IsNotExist(err) {
-		log.Infof("Skipping rename of %q to %q because target already exists.", target_filepath, new_target_filepath)
+		log.Infof("Skipping rename of %q to %q because target already exists.", target_path, new_target_path)
 		return
 	}
 
-	log.Infof("Renaming %q to %q", target_filepath, new_target_filepath)
+	log.Infof("Renaming %q to %q", target_path, new_target_path)
 	if isDryRun {
 		log.Debugf("Skipping: dry-run mode")
 		return
 	}
 
-	new_target_dir := filepath.Join(targetDir, filepath.Dir(src_filepath))
+	new_target_dir := filepath.Dir(new_target_path)
 	log.Debugf("Creating directory %q", new_target_dir)
 	if err = os.MkdirAll(new_target_dir, 0755); err != nil {
 		log.Fatal("Error creating new target directory %v", new_target_dir)
 	}
-	if err = os.Rename(target_filepath, new_target_filepath); err != nil {
-		log.Fatal("Error renaming %v to %v", target_filepath, new_target_filepath)
+	if err = os.Rename(target_path, new_target_path); err != nil {
+		log.Fatal("Error renaming %v to %v", target_path, new_target_path)
 	}
 }
 
@@ -180,7 +192,8 @@ func checksumFile(file string) string {
 
 func main() {
 	initialize()
-	getAllSourceFiles()
+	walkFiles(srcFiles, srcDir, true)
+	walkFiles(targetFiles, targetDir, false)
 	compareAndRenameTargetFiles()
 	os.Exit(0)
 }
